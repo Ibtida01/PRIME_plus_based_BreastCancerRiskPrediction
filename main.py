@@ -25,6 +25,9 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
+# NEW: import torchvision models
+import torchvision.models as models
+
 class HistoryConfig:
     """Configuration for history-based experiments"""
     CSV_PATH = '/kaggle/input/updatedcsv-having-pngs/CSAW-CC_breast_cancer_screening_data_backup.csv'
@@ -35,7 +38,7 @@ class HistoryConfig:
     FEATURE_DIM = 256
     BATCH_SIZE = 8
     LEARNING_RATE = 0.001
-    NUM_EPOCHS = 10  # Reduced for multiple experiments
+    NUM_EPOCHS = 20  # Reduced for multiple experiments
     
     # History experiments to run
     HISTORY_VALUES = [0, 1, 2, 3, 4]
@@ -230,38 +233,38 @@ def create_risk_labels(pairs_df):
     
     return pairs_df
 
-# Simplified model for multiple experiments
-class SimpleBreastCancerModel(nn.Module):
-    """Simplified model for quick experiments across different history values"""
-    
+# =========================
+# NEW MODEL: ResNet34-based
+# =========================
+class ResNet34BreastCancerModel(nn.Module):
+    """
+    ResNet-34 backbone (first conv adapted to 1 channel), clinical fusion,
+    and optional prior-image fusion to match the previous model's interface.
+    """
     def __init__(self, use_prior=True):
         super().__init__()
         self.use_prior = use_prior
-        
-        # Simple CNN backbone
-        self.backbone = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=7, stride=2, padding=3),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1))
+
+        # Build ResNet-34 backbone
+        self.backbone = models.resnet34(weights=None)  # avoid downloading weights in offline env
+        # Adapt first conv to single-channel input (1xHxW mammograms)
+        self.backbone.conv1 = nn.Conv2d(
+            in_channels=1,
+            out_channels=self.backbone.conv1.out_channels,
+            kernel_size=self.backbone.conv1.kernel_size,
+            stride=self.backbone.conv1.stride,
+            padding=self.backbone.conv1.padding,
+            bias=False
         )
-        
+        # Replace classifier head with Identity to extract 512-d features
+        self.backbone.fc = nn.Identity()
+
         # Feature dimensions
-        image_features = 128 * (2 if use_prior else 1)  # Prior + current or just current
+        image_feature_dim = 512 * (2 if use_prior else 1)  # prior + current or just current
         clinical_features = 6
-        total_features = image_features + clinical_features
-        
-        # Classifier
+        total_features = image_feature_dim + clinical_features
+
+        # Classifier (kept same sizes as before for minimal change in behavior)
         self.classifier = nn.Sequential(
             nn.Linear(total_features, 256),
             nn.ReLU(inplace=True),
@@ -271,30 +274,24 @@ class SimpleBreastCancerModel(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(64, 1)
         )
-    
-    def forward(self, prior_images, current_images, clinical_features):
-        # Extract features from current images
-        current_features = self.backbone(current_images)
-        current_features = current_features.view(current_features.size(0), -1)
-        
-        if self.use_prior:
-            # Extract features from prior images
-            prior_features = self.backbone(prior_images)
-            prior_features = prior_features.view(prior_features.size(0), -1)
-            
-            # Combine features
-            image_features = torch.cat([prior_features, current_features], dim=1)
-        else:
-            image_features = current_features
-        
-        # Combine with clinical features
-        all_features = torch.cat([image_features, clinical_features], dim=1)
-        
-        # Predict
-        output = self.classifier(all_features)
-        return output.squeeze(1)
 
-# Simplified dataset
+    def extract_feat(self, x):
+        # x: (B,1,H,W)
+        return self.backbone(x)  # (B, 512)
+
+    def forward(self, prior_images, current_images, clinical_features):
+        current_features = self.extract_feat(current_images)  # (B,512)
+        if self.use_prior:
+            prior_features = self.extract_feat(prior_images)   # (B,512)
+            image_features = torch.cat([prior_features, current_features], dim=1)  # (B,1024)
+        else:
+            image_features = current_features  # (B,512)
+
+        all_features = torch.cat([image_features, clinical_features], dim=1)
+        logits = self.classifier(all_features)
+        return logits.squeeze(1)
+
+# Simplified dataset (unchanged)
 class SimpleBreastCancerDataset(Dataset):
     def __init__(self, pairs_df, image_dir, mode='train'):
         self.pairs_df = pairs_df
@@ -461,7 +458,7 @@ def run_history_experiments(df):
         
         # Create model (use prior images for HISTORY > 0)
         use_prior = history_value > 0
-        model = SimpleBreastCancerModel(use_prior=use_prior).to(HistoryConfig.DEVICE)
+        model = ResNet34BreastCancerModel(use_prior=use_prior).to(HistoryConfig.DEVICE)
         
         # Train model
         best_auc, training_results = train_simple_model(model, train_loader, val_loader, history_value)
@@ -589,7 +586,7 @@ def create_results_table(all_results):
     best_history = max(all_results.keys(), key=lambda h: all_results[h]['test_auc'])
     best_auc = all_results[best_history]['test_auc']
     
-    print(f"\n🏆 BEST PERFORMING CONFIGURATION:")
+    print(f"\n BEST PERFORMING CONFIGURATION:")
     print(f"   HISTORY = {best_history} (requires ≥{best_history + 1} years)")
     print(f"   Test AUC = {best_auc:.4f}")
     print(f"   Patients = {all_results[best_history]['n_patients']:,}")
